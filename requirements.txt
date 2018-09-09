@@ -1,0 +1,6 @@
+tensorflow
+easydict
+numpy
+nltk
+tqdm
+editdistance
