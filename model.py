@@ -22,6 +22,8 @@ class E2EModel:
                                           dtype=tf.int32)
         self.text_len = tf.placeholder(shape=[self._config.batch_size], dtype=tf.int32)
         self.seq_mask = tf.sequence_mask(self.text_len - 1, dtype=tf.float32)
+        self.dropout_in = tf.placeholder(dtype=tf.float32)
+        self.dropout_out = tf.placeholder(dtype=tf.float32)
         # inputs and targets preparation
         with tf.variable_scope('preprocessing'):
             self._hidden_repr, self._updated_len = self.input_preprocessing(self.sound_in, self.sound_len)
@@ -64,22 +66,35 @@ class E2EModel:
         inputs_reshaped = tf.reshape(pooled, shape=shape, name="merge_last_dim")
         return inputs_reshaped, updated_len
 
+    def _single_cell(self, units):
+        cells = tf.contrib.rnn.LSTMCell(units)
+        cells_drop = tf.nn.rnn_cell.DropoutWrapper(cell=cells, input_keep_prob=(1.0 - self.dropout_in),
+                                                   output_keep_prob=(1.0 - self.dropout_out))
+        return cells_drop
+
+    def _make_cells(self, layers, units):
+        cells = [self._single_cell(units) for _ in range(layers)]
+        cells_enc = tf.nn.rnn_cell.MultiRNNCell(cells)
+        return cells_enc
+
     def build_encoder(self, encoder_input, encoder_input_len):
-        cell_enc = tf.nn.rnn_cell.MultiRNNCell([tf.contrib.rnn.LSTMCell(self._config.cell_units)
-                                                for _ in range(self._config.encoder_layers)])
-        encoder_outputs, encoder_state = tf.nn.dynamic_rnn(cell_enc, encoder_input,
-                                                           sequence_length=encoder_input_len,
-                                                           time_major=False, dtype=tf.float32)
+        fw_cells = self._make_cells(self._config.encoder_layers, self._config.cell_units)
+        bw_cells = self._make_cells(self._config.encoder_layers, self._config.cell_units)
+        encoder_outputs, encoder_state = tf.nn.bidirectional_dynamic_rnn(
+            fw_cells, bw_cells, encoder_input, sequence_length=encoder_input_len,
+            time_major=False, dtype=tf.float32)
         encoder = EasyDict()
-        encoder.out = encoder_outputs
-        encoder.state = encoder_state
+        encoder.out = tf.concat(encoder_outputs, axis=-1, name='encoder-out')
+        concat_state = tuple([tf.contrib.rnn.LSTMStateTuple(c=tf.concat([x.c, y.c], axis=-1),
+                                                            h=tf.concat([x.h, y.h], axis=-1))
+                              for x, y in zip(encoder_state[0], encoder_state[1])])
+        encoder.state = concat_state
         return encoder
 
     def build_decoder(self, decoder_inputs, decoder_inputs_len, output_layer, embedding_decoder,
                       encoder):
-        cell_dec = tf.nn.rnn_cell.MultiRNNCell([tf.contrib.rnn.LSTMCell(self._config.cell_units)
-                                                for _ in range(self._config.decoder_layers)])
-        attention_mechanism = tf.contrib.seq2seq.LuongAttention(self._config.cell_units, encoder.out, scale=True)
+        cell_dec = self._make_cells(self._config.decoder_layers, 2 * self._config.cell_units)
+        attention_mechanism = tf.contrib.seq2seq.BahdanauAttention(self._config.cell_units, encoder.out, normalize=True)
         att_decoder_cell = tf.contrib.seq2seq.AttentionWrapper(cell_dec, attention_mechanism,
                                                                attention_layer_size=self._config.attention_units,
                                                                alignment_history=True)
@@ -88,7 +103,14 @@ class E2EModel:
             # we assume that encoder is at least as deep as decoder
             decoder_initial_state = decoder_initial_state.clone(
                 cell_state=tuple(encoder.state[self._config.encoder_layers - self._config.decoder_layers:]))
-        helper = tf.contrib.seq2seq.TrainingHelper(decoder_inputs, decoder_inputs_len, time_major=False)
+        if self._config.sampling_prob > 0 and embedding_decoder is not None:
+            self._logger.info(f'Using {100 * self._config.sampling_prob:2.0f}% sampling probability for training.')
+            helper = tf.contrib.seq2seq.ScheduledEmbeddingTrainingHelper(
+                decoder_inputs, decoder_inputs_len, embedding_decoder,
+                self._config.sampling_prob, time_major=False)
+        else:
+            self._logger.info('Running training in next symbol mode.')
+            helper = tf.contrib.seq2seq.TrainingHelper(decoder_inputs, decoder_inputs_len, time_major=False)
         decoder = tf.contrib.seq2seq.BasicDecoder(att_decoder_cell, helper, decoder_initial_state,
                                                   output_layer=output_layer)
         output, state, output_length = tf.contrib.seq2seq.dynamic_decode(decoder, output_time_major=False)
@@ -98,6 +120,7 @@ class E2EModel:
         decoder.train.state = state
         decoder.train.len = output_length
         if embedding_decoder is not None:
+            self._logger.info('Using GreedyEmbeddingHelper for inference time decoding.')
             emb_helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(embedding_decoder,
                                                                   tf.fill([self._config.batch_size], 0), 0)
             emb_decoder = tf.contrib.seq2seq.BasicDecoder(att_decoder_cell, emb_helper, decoder_initial_state,
@@ -114,52 +137,48 @@ class E2EModel:
         total_loss = 0
         handle = tqdm(iterable, unit='batch', desc='Training')
         for b in handle:
-            feed_dict = {self.sound_in: b[0], self.sound_len: b[1], self.text_target: b[2], self.text_len: b[3]}
+            feed_dict = {self.sound_in: b[0], self.sound_len: b[1], self.text_target: b[2], self.text_len: b[3],
+                         self.dropout_in: self._config.dropout_in, self.dropout_out: self._config.dropout_out}
             _, loss, step = self.session.run([self.train_op, self.loss, self.global_step], feed_dict)
             total_loss = 0.9 * total_loss + 0.1 * loss
             handle.set_description(f'Train loss: {total_loss:2.2f}, step {step}')
 
     def get_metrics(self, iterable):
         total_loss = 0
-        train_distance = 0
         infer_distance = 0
         total_chars = 0
         batches_num = 0
         ideally = 0
         for b in tqdm(iterable, unit='batch', desc='Computing metrics'):
             batches_num += 1
-            feed_dict = {self.sound_in: b[0], self.sound_len: b[1], self.text_target: b[2], self.text_len: b[3]}
-            loss, trans_train, trans_infer, len_infer = self.session.run(
-                [self.loss, self.decoder.train.out, self.decoder.infer.out, self.decoder.infer.len], feed_dict)
+            feed_dict = {self.sound_in: b[0], self.sound_len: b[1], self.text_target: b[2], self.text_len: b[3],
+                         self.dropout_in: 0.0, self.dropout_out: 0.0}
+            loss, trans_infer, len_infer = self.session.run(
+                [self.loss, self.decoder.infer.out, self.decoder.infer.len], feed_dict)
             total_loss += loss
             for bi in range(self._config.batch_size):
                 target_text = b[2][bi, 1:b[3][bi]].astype(np.int32)
-                train_text = trans_train[1][bi, :b[3][bi]-1]
-                assert len(target_text) == len(train_text)
                 infer_text = trans_infer[1][bi, :len_infer[bi]]
-                train_distance += ed.eval(target_text, train_text)
                 new_infer_dist = ed.eval(target_text, infer_text)
                 infer_distance += new_infer_dist
                 total_chars += len(target_text)
                 if new_infer_dist < 1:
-                    ideally += 1
+                    ideally += 1.0
         gt_text = ' '.join([self._abc.get_char(x) for x in target_text])
-        tr_text = ' '.join([self._abc.get_char(x) for x in train_text])
         in_text = ' '.join([self._abc.get_char(x) for x in infer_text])
         self._logger.info(f'Ground truth: {gt_text}')
-        self._logger.info(f'Train text: {tr_text}')
         self._logger.info(f'Infer text: {in_text}')
         total_loss /= batches_num
-        train_distance /= total_chars
         infer_distance /= total_chars
         ideally /= batches_num * self._config.batch_size
-        return total_loss, train_distance, infer_distance, ideally
+        return total_loss, infer_distance, ideally
 
     def transcribe(self, features):
         batch_features = np.concatenate([features[np.newaxis, :]] * self._config.batch_size, axis=0)
         batch_len = [features.shape[0]] * self._config.batch_size
         trans, lens = self.session.run([self.decoder.infer.out, self.decoder.infer.len],
-                                       {self.sound_in: batch_features, self.sound_len: batch_len})
+                                       {self.sound_in: batch_features, self.sound_len: batch_len,
+                                        self.dropout_in: 0.0, self.dropout_out: 0.0})
         char_ids = trans[1][0, :lens[0]]
         probs_mat = trans[0][0, :, :]
         return [self._abc.get_char(x) for x in char_ids], probs_mat

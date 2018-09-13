@@ -1,3 +1,6 @@
+from collections import Counter
+
+
 class ABC:
     def __init__(self):
         self.GO = 1
@@ -20,3 +23,19 @@ class ABC:
         self.vocab['<GO>'] = self.GO
         self.vocab['<EOS>'] = self.EOS
         self.rev_vocab = {ic: c for c, ic in self.vocab.items()}
+
+
+class BPE(ABC):
+    def __init__(self):
+        super().__init__()
+        self._all_data = []
+
+    def update(self, string):
+        super().update(string)
+        self._all_data.append(string)
+
+    def compile(self):
+        super().compile()
+        old_size = sum([len(x) for x in self._all_data])
+        while True:
+            pass
