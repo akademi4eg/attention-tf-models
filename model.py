@@ -33,12 +33,15 @@ class E2EModel:
         self.decoder_emb = tf.nn.embedding_lookup(self.embedding_decoder, self.text_target[:, :-1])
         self.projection_layer = Dense(len(self._abc.vocab), use_bias=False)
         # encoder-decoder
+        self._logger.info('Preparing encoder graph...')
         with tf.variable_scope('encoder'):
             self.encoder = self.build_encoder(self._hidden_repr, self._updated_len)
+        self._logger.info('Preparing decoder graph...')
         with tf.variable_scope('decoder'):
             self.decoder = self.build_decoder(self.decoder_emb, self.text_len - 1, self.projection_layer,
                                               self.embedding_decoder, self.encoder)
         # training part
+        self._logger.info('Preparing optimizer graph...')
         self.loss = tf.contrib.seq2seq.sequence_loss(logits=self.decoder.train.out[0],
                                                      targets=self.text_target[:, 1:],
                                                      weights=self.seq_mask)
@@ -72,29 +75,63 @@ class E2EModel:
                                                    output_keep_prob=(1.0 - self.dropout_out))
         return cells_drop
 
+    def _bi_cell(self, units):
+        with tf.variable_scope('forward'):
+            fw_cell = self._single_cell(units)
+        with tf.variable_scope('backward'):
+            bw_cell = self._single_cell(units)
+        return fw_cell, bw_cell
+
     def _make_cells(self, layers, units):
+        self._logger.info(f'LSTM stacks: {layers} layers x {units} units.')
         cells = [self._single_cell(units) for _ in range(layers)]
         cells_enc = tf.nn.rnn_cell.MultiRNNCell(cells)
         return cells_enc
 
-    def build_encoder(self, encoder_input, encoder_input_len):
-        fw_cells = self._make_cells(self._config.encoder_layers, self._config.cell_units)
-        bw_cells = self._make_cells(self._config.encoder_layers, self._config.cell_units)
+    def _encoder_bilayer(self, encoder_input, encoder_input_len):
+        fw_cell, bw_cell = self._bi_cell(self._config.cell_units)
         encoder_outputs, encoder_state = tf.nn.bidirectional_dynamic_rnn(
-            fw_cells, bw_cells, encoder_input, sequence_length=encoder_input_len,
+            fw_cell, bw_cell, encoder_input, sequence_length=encoder_input_len,
             time_major=False, dtype=tf.float32)
+        return self._bilayer_to_flat(encoder_outputs, encoder_state)
+
+    def _bilayer_to_flat(self, encoder_outputs, encoder_state):
+        outputs = tf.concat(encoder_outputs, axis=-1, name='encoder-out')
+        self._logger.info(f'Merging bi-layer into a flat one '
+                          f'2x{encoder_outputs[0].get_shape()[-1]} -> {outputs.get_shape()[-1]}')
+        concat_state = tf.contrib.rnn.LSTMStateTuple(
+            c=tf.concat([encoder_state[0].c, encoder_state[1].c], axis=-1),
+            h=tf.concat([encoder_state[0].h, encoder_state[1].h], axis=-1))
+        self._logger.info(f'State sizes: c-{concat_state.c.get_shape()[-1]}, h-{concat_state.h.get_shape()[-1]}.')
+        return outputs, concat_state
+
+    def _pyramidal_stack(self, outputs, sequence_length):
+        max_time = tf.shape(outputs)[1]
+        num_units = outputs.get_shape().as_list()[-1]
+        paddings = [[0, 0], [0, tf.floormod(max_time, 2)], [0, 0]]
+        outputs = tf.pad(outputs, paddings)
+        concat_outputs = tf.reshape(outputs, (self._config.batch_size, -1, num_units * 2))
+        return concat_outputs, tf.floordiv(sequence_length, 2) + tf.floormod(sequence_length, 2)
+
+    def build_encoder(self, encoder_input, encoder_input_len):
+        states = []
+        for layer in range(self._config.encoder_layers):
+            encoder_input, encoder_input_len = self._pyramidal_stack(encoder_input, encoder_input_len)
+            with tf.variable_scope('pyr_stack_{}'.format(layer)):
+                encoder_input, state = self._encoder_bilayer(encoder_input, encoder_input_len)
+            states.append(state)
+
         encoder = EasyDict()
-        encoder.out = tf.concat(encoder_outputs, axis=-1, name='encoder-out')
-        concat_state = tuple([tf.contrib.rnn.LSTMStateTuple(c=tf.concat([x.c, y.c], axis=-1),
-                                                            h=tf.concat([x.h, y.h], axis=-1))
-                              for x, y in zip(encoder_state[0], encoder_state[1])])
-        encoder.state = concat_state
+        encoder.out = encoder_input
+        encoder.state = tuple(states)
+        encoder.len = encoder_input_len
         return encoder
 
     def build_decoder(self, decoder_inputs, decoder_inputs_len, output_layer, embedding_decoder,
                       encoder):
-        cell_dec = self._make_cells(self._config.decoder_layers, 2 * self._config.cell_units)
-        attention_mechanism = tf.contrib.seq2seq.BahdanauAttention(self._config.cell_units, encoder.out, normalize=True)
+        cell_dec = self._make_cells(self._config.decoder_layers, encoder.state[0].c.get_shape()[-1])
+        attention_mechanism = tf.contrib.seq2seq.BahdanauAttention(encoder.out.get_shape()[-1], encoder.out,
+                                                                   normalize=True)
         att_decoder_cell = tf.contrib.seq2seq.AttentionWrapper(cell_dec, attention_mechanism,
                                                                attention_layer_size=self._config.attention_units,
                                                                alignment_history=True)
@@ -119,6 +156,7 @@ class E2EModel:
         decoder.train.out = output
         decoder.train.state = state
         decoder.train.len = output_length
+        decoder.train.attention = state[-2].stack()
         if embedding_decoder is not None:
             self._logger.info('Using GreedyEmbeddingHelper for inference time decoding.')
             emb_helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(embedding_decoder,
@@ -131,6 +169,7 @@ class E2EModel:
             decoder.infer.out = emb_outputs
             decoder.infer.state = emb_state
             decoder.infer.len = emb_length
+            decoder.infer.attention = emb_state[-2].stack()
         return decoder
 
     def train(self, iterable):
@@ -167,7 +206,7 @@ class E2EModel:
         gt_text = ' '.join([self._abc.get_char(x) for x in target_text])
         in_text = ' '.join([self._abc.get_char(x) for x in infer_text])
         self._logger.info(f'Ground truth: {gt_text}')
-        self._logger.info(f'Infer text: {in_text}')
+        self._logger.info(f'Infer text  : {in_text}')
         total_loss /= batches_num
         infer_distance /= total_chars
         ideally /= batches_num * self._config.batch_size
@@ -176,12 +215,13 @@ class E2EModel:
     def transcribe(self, features):
         batch_features = np.concatenate([features[np.newaxis, :]] * self._config.batch_size, axis=0)
         batch_len = [features.shape[0]] * self._config.batch_size
-        trans, lens = self.session.run([self.decoder.infer.out, self.decoder.infer.len],
-                                       {self.sound_in: batch_features, self.sound_len: batch_len,
-                                        self.dropout_in: 0.0, self.dropout_out: 0.0})
+        trans, lens, align = self.session.run(
+            [self.decoder.infer.out, self.decoder.infer.len, self.decoder.infer.attention],
+            {self.sound_in: batch_features, self.sound_len: batch_len,
+             self.dropout_in: 0.0, self.dropout_out: 0.0})
         char_ids = trans[1][0, :lens[0]]
         probs_mat = trans[0][0, :, :]
-        return [self._abc.get_char(x) for x in char_ids], probs_mat
+        return [self._abc.get_char(x) for x in char_ids], probs_mat, np.squeeze(align[:, 0, :])
 
     def save(self):
         self._saver.save(self.session, 'data/model')

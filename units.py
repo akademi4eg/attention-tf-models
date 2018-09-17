@@ -26,9 +26,10 @@ class ABC:
 
 
 class BPE(ABC):
-    def __init__(self):
+    def __init__(self, vocab_size):
         super().__init__()
         self._all_data = []
+        self.vocab_size = vocab_size
 
     def update(self, string):
         super().update(string)
@@ -36,6 +37,5 @@ class BPE(ABC):
 
     def compile(self):
         super().compile()
-        old_size = sum([len(x) for x in self._all_data])
-        while True:
+        for _ in range(self.vocab_size):
             pass
