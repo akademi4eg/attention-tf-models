@@ -10,9 +10,8 @@ Stack of LSTMs with Bahdanau attention. Decoder is unidirectional and thus opera
 ## Experiments
 ### Grapheme to phoneme
 Simple model to test the pipeline.
-Translates english words to phones. Trained on CMUDict.
-Successful training should get you about 8% character error rate and 34% word error rate.
-That's on version that doesn't take into account stress.
+Translates english words to phones. Trained on CMUDict. With most of configurations you should expect to get below 50% WER.
+Pyramidal stacks don't seem to be optimal architecture choice for this task, so getting below 40% would be challenging.
 To do training, run `train_g2p.py`. To test transcription on some words, run `transcribe_g2p.py`.
 Example config for G2P:
 ```python
