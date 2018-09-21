@@ -3,16 +3,17 @@ import tensorflow as tf
 
 from config import config
 from model import E2EModel
-from cmu_source import CMUDataSource
+from timit_source import TimitSource
 from units import ABC
+from features import raw_waveform
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger('train')
-    data_source = CMUDataSource('chars', ABC(), ABC(), False)
-    config.features_num = len(data_source.abc_gr.vocab)
+    data_source = TimitSource('ti-chars', config, ABC(), raw_waveform)
+    config.features_num = 1  # 1 channel waveform
     with tf.Session() as sess:
-        model = E2EModel(config, data_source.abc_ph, sess)
+        model = E2EModel(config, data_source.abc, sess)
         sess.run(tf.global_variables_initializer())
         model.load()
         logger.info('Starting training.')
