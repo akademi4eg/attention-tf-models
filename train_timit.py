@@ -5,13 +5,13 @@ from config import config
 from model import E2EModel
 from timit_source import TimitSource
 from units import ABC
-from features import raw_waveform
+from features import log_melspectrogram
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger('train')
-    data_source = TimitSource('ti-chars', config, ABC(), raw_waveform)
-    config.features_num = 1  # 1 channel waveform
+    data_source = TimitSource('ti-chars', config, ABC(), log_melspectrogram)
+    config.features_num = 64
     with tf.Session() as sess:
         model = E2EModel(config, data_source.abc, sess)
         sess.run(tf.global_variables_initializer())

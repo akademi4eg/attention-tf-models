@@ -24,6 +24,9 @@ class TimitSource:
             self.save()
         self._logger.info(f'Read {len(self._train)} files for "TRAIN" subset.')
         self._logger.info(f'Read {len(self._test)} files for "TEST" subset.')
+        self._cache = {}
+        self._mean = None
+        self._std = None
 
     def compile_abc(self):
         for _, c in self._train:
@@ -44,6 +47,12 @@ class TimitSource:
         with open(f'data/vocab_{self.name}_data.pickle', 'rb') as f:
             self._train = pickle.load(f)
             self._test = pickle.load(f)
+        try:
+            with open(f'data/vocab_{self.name}_norm.pickle', 'rb') as f:
+                self._mean = pickle.load(f)
+                self._std = pickle.load(f)
+        except FileNotFoundError:
+            self._logger.warning('Failed to load normalization.')
 
     def _read_utterances(self, subset):
         data = []
@@ -73,8 +82,17 @@ class TimitSource:
                 inputs = []
                 texts = []
                 for path, text in batch_data:
-                    waveform, _ = librosa.load(path, self.sample_rate, mono=True, dtype=np.float32)
-                    inputs.append(self.sound_to_features(waveform))
+                    if path not in self._cache:
+                        waveform, _ = librosa.load(path, self.sample_rate, mono=True, dtype=np.float32)
+                        features = self.sound_to_features(waveform)
+                        self._cache[path] = features
+                    if self._mean is None:
+                        self._mean = self._cache[path].mean(axis=0)[np.newaxis, :]
+                        self._std = self._cache[path].std(axis=0)[np.newaxis, :]
+                        with open(f'data/vocab_{self.name}_norm.pickle', 'wb') as f:
+                            pickle.dump(self._mean, f)
+                            pickle.dump(self._std, f)
+                    inputs.append(self.normalize(self._cache[path]))
                     texts.append([self.abc.GO] + [self.abc.vocab[p] for p in text] + [self.abc.EOS])
                 inputs_lens = [x.shape[0] for x in inputs]
                 texts_lens = [len(x) for x in texts]
@@ -82,5 +100,9 @@ class TimitSource:
                 features = np.zeros(shape=(batch_size, max(inputs_lens), features_num))
                 targets = np.zeros(shape=(batch_size, max(texts_lens)))
                 for bi, data in enumerate(texts):
+                    features[bi, :inputs_lens[bi], :] = inputs[bi]
                     targets[bi, :texts_lens[bi]] = data
                 yield features, inputs_lens, targets, texts_lens
+
+    def normalize(self, features):
+        return (features - self._mean) / self._std
