@@ -5,6 +5,7 @@ import pickle
 import random
 import numpy as np
 from tqdm import tqdm
+from collections import Counter
 
 
 class TimitSource:
@@ -56,6 +57,7 @@ class TimitSource:
 
     def _read_utterances(self, subset):
         data = []
+        phrases = Counter()
         for root, _, files in tqdm(os.walk(os.path.join(self._reader_path, subset)),
                                    desc=f'Collecting "{subset}"', unit='file'):
             for file in files:
@@ -68,6 +70,10 @@ class TimitSource:
                     # remove unnecessary complications
                     for c in {'"', ';', ':', ',', '.', '-', '?', '!'}:
                         text = text.replace(c, '')
+                    if phrases[text] > 7:
+                        # Prevent bias on two most common phrases.
+                        continue
+                    phrases[text] += 1
                 except FileNotFoundError:
                     continue
                 data.append((os.path.join(root, file), text))
